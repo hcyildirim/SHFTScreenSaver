@@ -11,6 +11,7 @@ typedef struct {
 typedef struct {
     int cellIdx;
     float opacity;
+    float prevOpacity;
     float phase;        // 0=waiting, 1=fading in, 2=fading out
     float timer;
     float fadeInTime;
@@ -20,17 +21,21 @@ typedef struct {
 @interface SHFTScreenSaverView : ScreenSaverView
 {
     BOOL didSetup;
-    CGImageRef bgImageRef;
+    void *bgPixels;             // raw pixel backup of background - just a malloc'd buffer
+    CGContextRef compCtx;       // persistent compositing buffer - pixels modified each frame
+    CGImageRef persistentImage; // single image backed by compCtx data - NEVER recreated
+    CGDataProviderRef persistentProvider; // data provider for persistentImage
+    int imgW;
+    int imgH;
+    size_t bufferSize;
     CellInfo *cellInfos;
     int cellCount;
-    CALayer *blinkLayers[MAX_BLINKS];
     BlinkState blinks[MAX_BLINKS];
     CFRunLoopTimerRef cfTimer;
 }
 - (void)tick;
 @end
 
-// C callback - no ObjC dispatch overhead
 static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     SHFTScreenSaverView *self = (__bridge SHFTScreenSaverView *)info;
     [self tick];
@@ -53,6 +58,7 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     if (self) {
         [self setAnimationTimeInterval:86400.0];
         self.wantsLayer = YES;
+        self.layer.actions = @{@"contents": [NSNull null]};
         didSetup = NO;
     }
     return self;
@@ -73,8 +79,10 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     CGFloat h = self.bounds.size.height;
     if (w <= 0 || h <= 0) return;
 
-    int iw = (int)w;
-    int ih = (int)h;
+    imgW = (int)w;
+    imgH = (int)h;
+    size_t bytesPerRow = (size_t)imgW * 4;
+    bufferSize = bytesPerRow * (size_t)imgH;
 
     NSBundle *bundle = [NSBundle bundleForClass:[self class]];
     NSString *path = [bundle pathForResource:@"shft_logo" ofType:@"png"];
@@ -88,12 +96,16 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     }
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(NULL, iw, ih, 8, iw * 4, cs,
-                                              kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
-    CGColorSpaceRelease(cs);
+    uint32_t bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host;
 
-    CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
-    CGContextFillRect(ctx, CGRectMake(0, 0, iw, ih));
+    // Temporary context to draw background, then we keep only the raw pixels
+    CGContextRef tmpCtx = CGBitmapContextCreate(NULL, imgW, imgH, 8, bytesPerRow, cs, bitmapInfo);
+    // Compositing context - pixels overwritten each frame via memcpy + fillrect
+    compCtx = CGBitmapContextCreate(NULL, imgW, imgH, 8, bytesPerRow, cs, bitmapInfo);
+
+    // Draw black + logos into tmpCtx
+    CGContextSetRGBFillColor(tmpCtx, 0, 0, 0, 1);
+    CGContextFillRect(tmpCtx, CGRectMake(0, 0, imgW, imgH));
 
     CGFloat logoDisplayWidth = w * 0.12;
     CGFloat aspect = logo ? (CGFloat)CGImageGetHeight(logo) / (CGFloat)CGImageGetWidth(logo) : 1.0;
@@ -117,10 +129,10 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
                 CGFloat cx = offsetX + col * spacingX;
                 CGFloat cy = offsetY + row * spacingY;
                 CGRect r = CGRectMake(cx - cellW/2, cy - cellH/2, cellW, cellH);
-                CGContextSaveGState(ctx);
-                CGContextSetAlpha(ctx, 0.85);
-                CGContextDrawImage(ctx, r, logo);
-                CGContextRestoreGState(ctx);
+                CGContextSaveGState(tmpCtx);
+                CGContextSetAlpha(tmpCtx, 0.85);
+                CGContextDrawImage(tmpCtx, r, logo);
+                CGContextRestoreGState(tmpCtx);
 
                 int idx = row * gridCols + col;
                 CGFloat x = cx - cellW/2;
@@ -134,47 +146,52 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
             }
         }
     }
-
-    CGImageRef bgImage = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
     if (logo) CGImageRelease(logo);
 
-    bgImageRef = bgImage;
-    self.layer.contents = (__bridge id)bgImageRef;
+    // Save background pixels into a plain malloc buffer, then release the temp context
+    void *tmpData = CGBitmapContextGetData(tmpCtx);
+    bgPixels = malloc(bufferSize);
+    memcpy(bgPixels, tmpData, bufferSize);
+    CGContextRelease(tmpCtx); // tmpCtx no longer needed — saves ~15MB
 
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
+    void *compData = CGBitmapContextGetData(compCtx);
+    memcpy(compData, bgPixels, bufferSize);
 
-    CGColorRef greenColor = CGColorCreateGenericRGB(SHFT_GREEN_R, SHFT_GREEN_G, SHFT_GREEN_B, 1.0);
-    NSDictionary *noActions = @{
-        @"opacity": [NSNull null],
-        @"position": [NSNull null],
-        @"bounds": [NSNull null],
-        @"frame": [NSNull null]
-    };
+    // Create ONE persistent CGImage backed by compCtx's pixel buffer
+    // This image is NEVER recreated - it always points to the same memory
+    persistentProvider = CGDataProviderCreateWithData(NULL, compData, bufferSize, NULL);
+    persistentImage = CGImageCreate(
+        imgW, imgH,
+        8,                          // bits per component
+        32,                         // bits per pixel
+        bytesPerRow,
+        cs,
+        kCGBitmapByteOrder32Host | kCGImageAlphaPremultipliedFirst,
+        persistentProvider,
+        NULL,                       // decode array
+        false,                      // should interpolate
+        kCGRenderingIntentDefault
+    );
 
+    CGColorSpaceRelease(cs);
+
+    // Set contents once - this same image object stays forever
+    self.layer.contents = (__bridge id)persistentImage;
+
+    // Init blink states
     for (int i = 0; i < MAX_BLINKS; i++) {
-        blinkLayers[i] = [CALayer layer];
-        blinkLayers[i].backgroundColor = greenColor;
-        blinkLayers[i].opacity = 0.0f;
-        blinkLayers[i].frame = CGRectMake(0, 0, 1, 1);
-        blinkLayers[i].actions = noActions;
-        [self.layer addSublayer:blinkLayers[i]];
-
         blinks[i].phase = 0;
         blinks[i].opacity = 0.0f;
+        blinks[i].prevOpacity = -1.0f;
         blinks[i].timer = 1.0f + (float)i * 1.2f;
         blinks[i].cellIdx = arc4random_uniform((uint32_t)cellCount);
     }
 
-    CGColorRelease(greenColor);
-    [CATransaction commit];
-
-    // CFRunLoopTimer - pure C timer, zero ObjC overhead per fire
+    // Timer at 2fps
     CFRunLoopTimerContext timerCtx = {0, (__bridge void *)self, NULL, NULL, NULL};
     cfTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
-                                   CFAbsoluteTimeGetCurrent() + 0.2,
-                                   0.2,  // 5 fps
+                                   CFAbsoluteTimeGetCurrent() + 0.5,
+                                   0.5,
                                    0, 0,
                                    timerCallback,
                                    &timerCtx);
@@ -183,51 +200,69 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
 
 - (void)tick
 {
-    @autoreleasepool {
-        // Purge recovery
-        if (bgImageRef && !self.layer.contents) {
-            self.layer.contents = (__bridge id)bgImageRef;
-        }
+    float dt = 0.5f;
+    BOOL needsRedraw = NO;
 
-        float dt = 0.2f;
+    for (int i = 0; i < MAX_BLINKS; i++) {
+        blinks[i].timer -= dt;
 
-        for (int i = 0; i < MAX_BLINKS; i++) {
-            blinks[i].timer -= dt;
-
-            if (blinks[i].phase == 0) {
-                if (blinks[i].timer <= 0) {
-                    blinks[i].cellIdx = arc4random_uniform((uint32_t)cellCount);
-                    blinks[i].fadeInTime = 0.3f + (float)(arc4random_uniform(200)) / 1000.0f;
-                    blinks[i].fadeOutTime = 0.5f + (float)(arc4random_uniform(400)) / 1000.0f;
-                    blinks[i].phase = 1;
-                    blinks[i].timer = blinks[i].fadeInTime;
-                    blinkLayers[i].frame = cellInfos[blinks[i].cellIdx].frame;
-                }
-            } else if (blinks[i].phase == 1) {
-                float progress = 1.0f - (blinks[i].timer / blinks[i].fadeInTime);
-                if (progress > 1.0f) progress = 1.0f;
-                blinks[i].opacity = progress * progress;
-
-                if (blinks[i].timer <= 0) {
-                    blinks[i].phase = 2;
-                    blinks[i].timer = blinks[i].fadeOutTime;
-                    blinks[i].opacity = 1.0f;
-                }
-            } else {
-                float progress = 1.0f - (blinks[i].timer / blinks[i].fadeOutTime);
-                if (progress > 1.0f) progress = 1.0f;
-                blinks[i].opacity = 1.0f - progress * progress;
-
-                if (blinks[i].timer <= 0) {
-                    blinks[i].phase = 0;
-                    blinks[i].timer = 2.0f + (float)(arc4random_uniform(4000)) / 1000.0f;
-                    blinks[i].opacity = 0.0f;
-                }
+        if (blinks[i].phase == 0) {
+            if (blinks[i].timer <= 0) {
+                blinks[i].cellIdx = arc4random_uniform((uint32_t)cellCount);
+                blinks[i].fadeInTime = 0.5f + (float)(arc4random_uniform(500)) / 1000.0f;
+                blinks[i].fadeOutTime = 1.0f + (float)(arc4random_uniform(1000)) / 1000.0f;
+                blinks[i].phase = 1;
+                blinks[i].timer = blinks[i].fadeInTime;
             }
-
-            blinkLayers[i].opacity = blinks[i].opacity;
+        } else if (blinks[i].phase == 1) {
+            float progress = 1.0f - (blinks[i].timer / blinks[i].fadeInTime);
+            if (progress > 1.0f) progress = 1.0f;
+            blinks[i].opacity = progress * progress;
+            if (blinks[i].timer <= 0) {
+                blinks[i].phase = 2;
+                blinks[i].timer = blinks[i].fadeOutTime;
+                blinks[i].opacity = 1.0f;
+            }
+        } else {
+            float progress = 1.0f - (blinks[i].timer / blinks[i].fadeOutTime);
+            if (progress > 1.0f) progress = 1.0f;
+            blinks[i].opacity = 1.0f - progress * progress;
+            if (blinks[i].timer <= 0) {
+                blinks[i].phase = 0;
+                blinks[i].timer = 3.0f + (float)(arc4random_uniform(5000)) / 1000.0f;
+                blinks[i].opacity = 0.0f;
+            }
         }
-    } // @autoreleasepool drains ALL hidden CA internal objects immediately
+
+        float delta = blinks[i].opacity - blinks[i].prevOpacity;
+        if (delta < 0) delta = -delta;
+        if (delta > 0.02f) {
+            needsRedraw = YES;
+            blinks[i].prevOpacity = blinks[i].opacity;
+        }
+    }
+
+    if (!needsRedraw) return;
+
+    // Restore background pixels into compCtx buffer (pure memcpy, zero allocation)
+    void *compData = CGBitmapContextGetData(compCtx);
+    memcpy(compData, bgPixels, bufferSize);
+
+    // Draw green squares directly into compCtx buffer
+    for (int i = 0; i < MAX_BLINKS; i++) {
+        if (blinks[i].opacity > 0.01f) {
+            CGContextSaveGState(compCtx);
+            CGContextSetAlpha(compCtx, blinks[i].opacity);
+            CGContextSetRGBFillColor(compCtx, SHFT_GREEN_R, SHFT_GREEN_G, SHFT_GREEN_B, 1.0);
+            CGContextFillRect(compCtx, cellInfos[blinks[i].cellIdx].frame);
+            CGContextRestoreGState(compCtx);
+        }
+    }
+
+    // Pixels changed in-place. Tell CA to re-read by re-setting same image.
+    // No new CGImage created - persistentImage still points to same compData buffer.
+    self.layer.contents = nil;
+    self.layer.contents = (__bridge id)persistentImage;
 }
 
 - (void)animateOneFrame { }
@@ -253,8 +288,11 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
         CFRelease(cfTimer);
         cfTimer = NULL;
     }
+    if (persistentImage) { CGImageRelease(persistentImage); persistentImage = NULL; }
+    if (persistentProvider) { CGDataProviderRelease(persistentProvider); persistentProvider = NULL; }
     if (cellInfos) { free(cellInfos); cellInfos = NULL; }
-    if (bgImageRef) { CGImageRelease(bgImageRef); bgImageRef = NULL; }
+    if (bgPixels) { free(bgPixels); bgPixels = NULL; }
+    if (compCtx) { CGContextRelease(compCtx); compCtx = NULL; }
 }
 
 @end
