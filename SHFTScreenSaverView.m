@@ -1,6 +1,7 @@
 #import <ScreenSaver/ScreenSaver.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <sys/mman.h>
 
 #define MAX_BLINKS 6
 
@@ -12,26 +13,31 @@ typedef struct {
     int cellIdx;
     float opacity;
     float prevOpacity;
-    float phase;        // 0=waiting, 1=fading in, 2=fading out
+    float phase;
     float timer;
     float fadeInTime;
     float fadeOutTime;
 } BlinkState;
 
+// ── Static (process-wide) shared resources ──
+// legacyScreenSaver creates NEW view instances per activation cycle.
+// By making heavy allocations static, all instances share the same buffers.
+// This eliminates ~34MB allocation per start/stop cycle.
+static BOOL s_didSetup = NO;
+static void *s_bgPixels = NULL;         // mmap'd background pixel backup
+static CGImageRef s_bgImage = NULL;     // pre-rendered background as CGImage (set once)
+static CellInfo *s_cellInfos = NULL;
+static int s_cellCount = 0;
+static int s_imgW = 0;
+static int s_imgH = 0;
+static size_t s_bytesPerRow = 0;
+static size_t s_bufferSize = 0;
+
 @interface SHFTScreenSaverView : ScreenSaverView
 {
-    BOOL didSetup;
-    void *bgPixels;             // raw pixel backup of background - just a malloc'd buffer
-    CGContextRef compCtx;       // persistent compositing buffer - pixels modified each frame
-    CGImageRef persistentImage; // single image backed by compCtx data - NEVER recreated
-    CGDataProviderRef persistentProvider; // data provider for persistentImage
-    int imgW;
-    int imgH;
-    size_t bufferSize;
-    CellInfo *cellInfos;
-    int cellCount;
     BlinkState blinks[MAX_BLINKS];
     CFRunLoopTimerRef cfTimer;
+    BOOL blinksInitialized;
 }
 - (void)tick;
 @end
@@ -58,8 +64,17 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     if (self) {
         [self setAnimationTimeInterval:86400.0];
         self.wantsLayer = YES;
-        self.layer.actions = @{@"contents": [NSNull null]};
-        didSetup = NO;
+        self.layer.drawsAsynchronously = YES;
+        self.layer.actions = @{
+            @"contents": [NSNull null],
+            @"onOrderIn": [NSNull null],
+            @"onOrderOut": [NSNull null],
+            @"sublayers": [NSNull null],
+            @"bounds": [NSNull null],
+            @"position": [NSNull null]
+        };
+        self.layer.delegate = (id)self;
+        blinksInitialized = NO;
     }
     return self;
 }
@@ -67,22 +82,52 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
 - (void)startAnimation
 {
     [super startAnimation];
-    if (!didSetup) {
-        didSetup = YES;
-        [self setupEverything];
+
+    // One-time static setup (shared across all instances in the process)
+    if (!s_didSetup) {
+        s_didSetup = YES;
+        [self setupStaticResources];
+    }
+
+    // Per-instance: init blink states once
+    if (!blinksInitialized) {
+        blinksInitialized = YES;
+        for (int i = 0; i < MAX_BLINKS; i++) {
+            blinks[i].phase = 0;
+            blinks[i].opacity = 0.0f;
+            blinks[i].prevOpacity = -1.0f;
+            blinks[i].timer = 1.0f + (float)i * 1.2f;
+            blinks[i].cellIdx = arc4random_uniform((uint32_t)s_cellCount);
+        }
+    }
+
+    // Restore layer delegate (cleared in stopAnimation to release backing store)
+    self.layer.delegate = (id)self;
+
+    // Force initial draw
+    [self.layer setNeedsDisplay];
+
+    // Start per-instance timer
+    if (!cfTimer) {
+        CFRunLoopTimerContext timerCtx = {0, (__bridge void *)self, NULL, NULL, NULL};
+        cfTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+                                       CFAbsoluteTimeGetCurrent() + 0.5,
+                                       0.5, 0, 0,
+                                       timerCallback, &timerCtx);
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), cfTimer, kCFRunLoopCommonModes);
     }
 }
 
-- (void)setupEverything
+- (void)setupStaticResources
 {
     CGFloat w = self.bounds.size.width;
     CGFloat h = self.bounds.size.height;
     if (w <= 0 || h <= 0) return;
 
-    imgW = (int)w;
-    imgH = (int)h;
-    size_t bytesPerRow = (size_t)imgW * 4;
-    bufferSize = bytesPerRow * (size_t)imgH;
+    s_imgW = (int)w;
+    s_imgH = (int)h;
+    s_bytesPerRow = (size_t)s_imgW * 4;
+    s_bufferSize = s_bytesPerRow * (size_t)s_imgH;
 
     NSBundle *bundle = [NSBundle bundleForClass:[self class]];
     NSString *path = [bundle pathForResource:@"shft_logo" ofType:@"png"];
@@ -98,14 +143,13 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     uint32_t bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host;
 
-    // Temporary context to draw background, then we keep only the raw pixels
-    CGContextRef tmpCtx = CGBitmapContextCreate(NULL, imgW, imgH, 8, bytesPerRow, cs, bitmapInfo);
-    // Compositing context - pixels overwritten each frame via memcpy + fillrect
-    compCtx = CGBitmapContextCreate(NULL, imgW, imgH, 8, bytesPerRow, cs, bitmapInfo);
+    // Allocate background buffer via mmap
+    s_bgPixels = mmap(NULL, s_bufferSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 
-    // Draw black + logos into tmpCtx
+    // Draw background into bgPixels
+    CGContextRef tmpCtx = CGBitmapContextCreate(s_bgPixels, s_imgW, s_imgH, 8, s_bytesPerRow, cs, bitmapInfo);
     CGContextSetRGBFillColor(tmpCtx, 0, 0, 0, 1);
-    CGContextFillRect(tmpCtx, CGRectMake(0, 0, imgW, imgH));
+    CGContextFillRect(tmpCtx, CGRectMake(0, 0, s_imgW, s_imgH));
 
     CGFloat logoDisplayWidth = w * 0.12;
     CGFloat aspect = logo ? (CGFloat)CGImageGetHeight(logo) / (CGFloat)CGImageGetWidth(logo) : 1.0;
@@ -120,8 +164,8 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     CGFloat offsetX = (w - totalGridW) / 2.0;
     CGFloat offsetY = (h - totalGridH) / 2.0;
 
-    cellCount = gridCols * gridRows;
-    cellInfos = (CellInfo *)calloc(cellCount, sizeof(CellInfo));
+    s_cellCount = gridCols * gridRows;
+    s_cellInfos = (CellInfo *)calloc(s_cellCount, sizeof(CellInfo));
 
     if (logo) {
         for (int row = 0; row < gridRows; row++) {
@@ -137,7 +181,7 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
                 int idx = row * gridCols + col;
                 CGFloat x = cx - cellW/2;
                 CGFloat y = cy - cellH/2;
-                cellInfos[idx].frame = CGRectMake(
+                s_cellInfos[idx].frame = CGRectMake(
                     x + SQ_REL_X * cellW,
                     y + (1.0 - SQ_REL_Y_TOP - SQ_REL_H) * cellH,
                     SQ_REL_W * cellW,
@@ -148,54 +192,40 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     }
     if (logo) CGImageRelease(logo);
 
-    // Save background pixels into a plain malloc buffer, then release the temp context
-    void *tmpData = CGBitmapContextGetData(tmpCtx);
-    bgPixels = malloc(bufferSize);
-    memcpy(bgPixels, tmpData, bufferSize);
-    CGContextRelease(tmpCtx); // tmpCtx no longer needed — saves ~15MB
+    // Create persistent background CGImage from the rendered pixels
+    s_bgImage = CGBitmapContextCreateImage(tmpCtx);
+    CGContextRelease(tmpCtx);
 
-    void *compData = CGBitmapContextGetData(compCtx);
-    memcpy(compData, bgPixels, bufferSize);
-
-    // Create ONE persistent CGImage backed by compCtx's pixel buffer
-    // This image is NEVER recreated - it always points to the same memory
-    persistentProvider = CGDataProviderCreateWithData(NULL, compData, bufferSize, NULL);
-    persistentImage = CGImageCreate(
-        imgW, imgH,
-        8,                          // bits per component
-        32,                         // bits per pixel
-        bytesPerRow,
-        cs,
-        kCGBitmapByteOrder32Host | kCGImageAlphaPremultipliedFirst,
-        persistentProvider,
-        NULL,                       // decode array
-        false,                      // should interpolate
-        kCGRenderingIntentDefault
-    );
+    // bgPixels buffer stays allocated (mmap) - we still need it? No, bgImage has its own copy.
+    // Free the mmap buffer since CGBitmapContextCreateImage made a copy
+    munmap(s_bgPixels, s_bufferSize);
+    s_bgPixels = NULL;
 
     CGColorSpaceRelease(cs);
+}
 
-    // Set contents once - this same image object stays forever
-    self.layer.contents = (__bridge id)persistentImage;
+// Core Animation calls this to draw our layer's content.
+// CA manages its own backing store - we just draw into the provided context.
+// NO CGImage creation, NO texture churn, ZERO allocation per frame.
+- (void)drawLayer:(CALayer *)layer inContext:(CGContextRef)ctx
+{
+    if (!s_bgImage) return;
 
-    // Init blink states
+    CGRect bounds = CGRectMake(0, 0, s_imgW, s_imgH);
+
+    // Draw background (pre-rendered, immutable)
+    CGContextDrawImage(ctx, bounds, s_bgImage);
+
+    // Draw active blink overlays
     for (int i = 0; i < MAX_BLINKS; i++) {
-        blinks[i].phase = 0;
-        blinks[i].opacity = 0.0f;
-        blinks[i].prevOpacity = -1.0f;
-        blinks[i].timer = 1.0f + (float)i * 1.2f;
-        blinks[i].cellIdx = arc4random_uniform((uint32_t)cellCount);
+        if (blinks[i].opacity > 0.01f) {
+            CGContextSaveGState(ctx);
+            CGContextSetAlpha(ctx, blinks[i].opacity);
+            CGContextSetRGBFillColor(ctx, SHFT_GREEN_R, SHFT_GREEN_G, SHFT_GREEN_B, 1.0);
+            CGContextFillRect(ctx, s_cellInfos[blinks[i].cellIdx].frame);
+            CGContextRestoreGState(ctx);
+        }
     }
-
-    // Timer at 2fps
-    CFRunLoopTimerContext timerCtx = {0, (__bridge void *)self, NULL, NULL, NULL};
-    cfTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
-                                   CFAbsoluteTimeGetCurrent() + 0.5,
-                                   0.5,
-                                   0, 0,
-                                   timerCallback,
-                                   &timerCtx);
-    CFRunLoopAddTimer(CFRunLoopGetCurrent(), cfTimer, kCFRunLoopCommonModes);
 }
 
 - (void)tick
@@ -208,7 +238,7 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
 
         if (blinks[i].phase == 0) {
             if (blinks[i].timer <= 0) {
-                blinks[i].cellIdx = arc4random_uniform((uint32_t)cellCount);
+                blinks[i].cellIdx = arc4random_uniform((uint32_t)s_cellCount);
                 blinks[i].fadeInTime = 0.5f + (float)(arc4random_uniform(500)) / 1000.0f;
                 blinks[i].fadeOutTime = 1.0f + (float)(arc4random_uniform(1000)) / 1000.0f;
                 blinks[i].phase = 1;
@@ -244,25 +274,8 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
 
     if (!needsRedraw) return;
 
-    // Restore background pixels into compCtx buffer (pure memcpy, zero allocation)
-    void *compData = CGBitmapContextGetData(compCtx);
-    memcpy(compData, bgPixels, bufferSize);
-
-    // Draw green squares directly into compCtx buffer
-    for (int i = 0; i < MAX_BLINKS; i++) {
-        if (blinks[i].opacity > 0.01f) {
-            CGContextSaveGState(compCtx);
-            CGContextSetAlpha(compCtx, blinks[i].opacity);
-            CGContextSetRGBFillColor(compCtx, SHFT_GREEN_R, SHFT_GREEN_G, SHFT_GREEN_B, 1.0);
-            CGContextFillRect(compCtx, cellInfos[blinks[i].cellIdx].frame);
-            CGContextRestoreGState(compCtx);
-        }
-    }
-
-    // Pixels changed in-place. Tell CA to re-read by re-setting same image.
-    // No new CGImage created - persistentImage still points to same compData buffer.
-    self.layer.contents = nil;
-    self.layer.contents = (__bridge id)persistentImage;
+    // Ask CA to redraw - it calls drawLayer:inContext: on its managed backing store
+    [self.layer setNeedsDisplay];
 }
 
 - (void)animateOneFrame { }
@@ -276,6 +289,10 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
         CFRelease(cfTimer);
         cfTimer = NULL;
     }
+    // Release this view's layer backing store so old instances don't hold ~17MB each.
+    // Static resources (s_bgImage, s_cellInfos) are unaffected.
+    self.layer.delegate = nil;
+    self.layer.contents = nil;
 }
 
 - (BOOL)hasConfigureSheet { return NO; }
@@ -288,11 +305,8 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
         CFRelease(cfTimer);
         cfTimer = NULL;
     }
-    if (persistentImage) { CGImageRelease(persistentImage); persistentImage = NULL; }
-    if (persistentProvider) { CGDataProviderRelease(persistentProvider); persistentProvider = NULL; }
-    if (cellInfos) { free(cellInfos); cellInfos = NULL; }
-    if (bgPixels) { free(bgPixels); bgPixels = NULL; }
-    if (compCtx) { CGContextRelease(compCtx); compCtx = NULL; }
+    // Static resources are NOT freed here - they persist for reuse by new instances.
+    // They live for the lifetime of the legacyScreenSaver process.
 }
 
 @end
