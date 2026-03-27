@@ -1,5 +1,5 @@
 #!/bin/bash
-PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.1/SHFTScreenSaver.pkg"
+PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.2/SHFTScreenSaver.pkg"
 PKG_PATH="/tmp/SHFTScreenSaver.pkg"
 
 # Download and install
@@ -208,4 +208,4 @@ AGENTEOF
 
     echo "Screen saver set for user: $USERNAME"
 done
-echo "SHFT Screen Saver v3.0 installed and activated for all users"
+echo "SHFT Screen Saver v3.2 installed and activated for all users"
