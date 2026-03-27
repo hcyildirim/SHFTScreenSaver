@@ -146,8 +146,10 @@ int main(int argc, const char *argv[]) {
             AVVideoWidthKey: @(VIDEO_W),
             AVVideoHeightKey: @(VIDEO_H),
             AVVideoCompressionPropertiesKey: @{
-                AVVideoAverageBitRateKey: @(5000000),
+                AVVideoAverageBitRateKey: @(8000000),
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoMaxKeyFrameIntervalKey: @(TOTAL_FRAMES),
+                AVVideoMaxKeyFrameIntervalDurationKey: @(DURATION_SECS),
             }
         };
 

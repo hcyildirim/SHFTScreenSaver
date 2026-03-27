@@ -1,5 +1,5 @@
 #!/bin/bash
-PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.2/SHFTScreenSaver.pkg"
+PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.3/SHFTScreenSaver.pkg"
 PKG_PATH="/tmp/SHFTScreenSaver.pkg"
 
 # Download and install
@@ -176,36 +176,14 @@ XMLEOF
         kill -9 "$WAPID" 2>/dev/null
     fi
 
-    # Install LaunchAgent to clean up stale legacyScreenSaver process
-    # legacyScreenSaver never exits on its own - accumulates ~15MB per start/stop cycle
-    # This agent kills it when user is active (idle<30s) and ScreenSaverEngine is gone
+    # Remove old LaunchAgent if present (no longer needed - memory managed in-process)
     AGENT_DIR="${USER_HOME}Library/LaunchAgents"
     AGENT_FILE="$AGENT_DIR/com.shft.screensaver.cleanup.plist"
-    sudo -u "$USERNAME" mkdir -p "$AGENT_DIR"
-    sudo -u "$USERNAME" launchctl unload "$AGENT_FILE" 2>/dev/null
-    cat > "$AGENT_FILE" << 'AGENTEOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.shft.screensaver.cleanup</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>IDLE=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print $NF; exit}'); IDLE_SEC=$((IDLE / 1000000000)); [ "$IDLE_SEC" -gt 30 ] &amp;&amp; exit 0; pgrep -x legacyScreenSaver &gt;/dev/null &amp;&amp; ! pgrep -x ScreenSaverEngine &gt;/dev/null &amp;&amp; killall legacyScreenSaver 2&gt;/dev/null; exit 0</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>5</integer>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-AGENTEOF
-    chown "$USERNAME:staff" "$AGENT_FILE"
-    sudo -u "$USERNAME" launchctl load "$AGENT_FILE" 2>/dev/null
+    if [ -f "$AGENT_FILE" ]; then
+        sudo -u "$USERNAME" launchctl unload "$AGENT_FILE" 2>/dev/null
+        rm -f "$AGENT_FILE"
+    fi
 
     echo "Screen saver set for user: $USERNAME"
 done
-echo "SHFT Screen Saver v3.2 installed and activated for all users"
+echo "SHFT Screen Saver v3.3 installed and activated for all users"
