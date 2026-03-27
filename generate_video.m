@@ -3,10 +3,10 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreVideo/CoreVideo.h>
 
-#define VIDEO_W 2560
-#define VIDEO_H 1600
+#define VIDEO_W 1280
+#define VIDEO_H 800
 #define FPS 30
-#define DURATION_SECS 30
+#define DURATION_SECS 60
 #define TOTAL_FRAMES (FPS * DURATION_SECS)
 #define MAX_BLINKS 6
 
@@ -206,16 +206,8 @@ int main(int argc, const char *argv[]) {
                     }
                 }
 
-                // Seamless loop: fade out blinks in last 1s, fade in during first 0.5s
-                float fadeMultiplier = 1.0f;
-                if (t > (float)(DURATION_SECS - 1)) {
-                    fadeMultiplier = (float)DURATION_SECS - t;
-                    if (fadeMultiplier < 0.0f) fadeMultiplier = 0.0f;
-                }
-                if (t < 0.5f) {
-                    float fadeIn = t / 0.5f;
-                    if (fadeIn < fadeMultiplier) fadeMultiplier = fadeIn;
-                }
+                // No fade at loop boundaries - blinks are subtle enough that
+                // a hard cut is invisible. Avoids visible dimming every loop.
 
                 // Get pixel buffer from pool
                 CVPixelBufferRef pixelBuffer = NULL;
@@ -243,7 +235,7 @@ int main(int argc, const char *argv[]) {
                 // Draw blink overlays
                 CGContextRef ctx = CGBitmapContextCreate(pxData, VIDEO_W, VIDEO_H, 8, pxBytesPerRow, cs, bitmapInfo);
                 for (int i = 0; i < MAX_BLINKS; i++) {
-                    float op = blinks[i].opacity * fadeMultiplier;
+                    float op = blinks[i].opacity;
                     if (op > 0.01f) {
                         CGContextSaveGState(ctx);
                         CGContextSetAlpha(ctx, op);

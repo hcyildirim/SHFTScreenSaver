@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.shft.screensaver.cleanup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>IDLE=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print $NF; exit}'); IDLE_SEC=$((IDLE / 1000000000)); [ "$IDLE_SEC" -gt 30 ] &amp;&amp; exit 0; pgrep -x legacyScreenSaver &gt;/dev/null &amp;&amp; ! pgrep -x ScreenSaverEngine &gt;/dev/null &amp;&amp; killall legacyScreenSaver 2&gt;/dev/null; exit 0</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>5</integer>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

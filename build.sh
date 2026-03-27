@@ -52,6 +52,7 @@ clang \
     -framework ScreenSaver \
     -framework AppKit \
     -framework AVFoundation \
+    -framework CoreMedia \
     -fobjc-arc \
     -o "$MACOS_DIR/SHFTScreenSaver" \
     "$PROJECT_DIR/SHFTScreenSaverView.m"

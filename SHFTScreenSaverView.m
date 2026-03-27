@@ -3,8 +3,7 @@
 
 @interface SHFTScreenSaverView : ScreenSaverView
 {
-    AVQueuePlayer *queuePlayer;
-    AVPlayerLooper *looper;
+    AVPlayer *player;
     AVPlayerLayer *playerLayer;
 }
 @end
@@ -25,30 +24,41 @@
 {
     [super startAnimation];
 
-    if (!queuePlayer) {
+    if (!player) {
         NSBundle *bundle = [NSBundle bundleForClass:[self class]];
         NSString *path = [bundle pathForResource:@"shft_screensaver" ofType:@"mov"];
         if (!path) return;
 
         NSURL *url = [NSURL fileURLWithPath:path];
-        AVPlayerItem *templateItem = [AVPlayerItem playerItemWithURL:url];
-        queuePlayer = [AVQueuePlayer queuePlayerWithItems:@[templateItem]];
-        looper = [AVPlayerLooper playerLooperWithPlayer:queuePlayer templateItem:templateItem];
+        player = [AVPlayer playerWithURL:url];
+        player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
 
-        playerLayer = [AVPlayerLayer playerLayerWithPlayer:queuePlayer];
+        // Seamless loop: seek to start when video ends (no gap, no new player item)
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(videoDidEnd:)
+                                                     name:AVPlayerItemDidPlayToEndTimeNotification
+                                                   object:player.currentItem];
+
+        playerLayer = [AVPlayerLayer playerLayerWithPlayer:player];
         playerLayer.frame = self.bounds;
         playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
         playerLayer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         [self.layer addSublayer:playerLayer];
     }
 
-    [queuePlayer play];
+    [player seekToTime:kCMTimeZero];
+    [player play];
+}
+
+- (void)videoDidEnd:(NSNotification *)notification
+{
+    [player seekToTime:kCMTimeZero toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
 }
 
 - (void)stopAnimation
 {
+    [player pause];
     [super stopAnimation];
-    [queuePlayer pause];
 }
 
 - (void)animateOneFrame { }
@@ -59,8 +69,7 @@
 
 - (void)dealloc
 {
-    [queuePlayer pause];
-    [playerLayer removeFromSuperlayer];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 @end
