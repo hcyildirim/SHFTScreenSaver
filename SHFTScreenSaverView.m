@@ -3,7 +3,8 @@
 
 @interface SHFTScreenSaverView : ScreenSaverView
 {
-    AVPlayer *player;
+    AVQueuePlayer *queuePlayer;
+    AVPlayerLooper *looper;
     AVPlayerLayer *playerLayer;
 }
 @end
@@ -24,40 +25,34 @@
 {
     [super startAnimation];
 
-    if (!player) {
+    if (!queuePlayer) {
         NSBundle *bundle = [NSBundle bundleForClass:[self class]];
         NSString *path = [bundle pathForResource:@"shft_screensaver" ofType:@"mov"];
         if (!path) return;
 
         NSURL *url = [NSURL fileURLWithPath:path];
-        player = [AVPlayer playerWithURL:url];
-        player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+        AVAsset *asset = [AVAsset assetWithURL:url];
+        AVPlayerItem *templateItem = [AVPlayerItem playerItemWithAsset:asset];
 
-        // Seamless loop: seek to start when video ends (no gap, no new player item)
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(videoDidEnd:)
-                                                     name:AVPlayerItemDidPlayToEndTimeNotification
-                                                   object:player.currentItem];
+        queuePlayer = [AVQueuePlayer queuePlayerWithItems:@[]];
+        queuePlayer.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
 
-        playerLayer = [AVPlayerLayer playerLayerWithPlayer:player];
+        // AVPlayerLooper handles gapless looping - pre-buffers next iteration
+        looper = [AVPlayerLooper playerLooperWithPlayer:queuePlayer templateItem:templateItem];
+
+        playerLayer = [AVPlayerLayer playerLayerWithPlayer:queuePlayer];
         playerLayer.frame = self.bounds;
         playerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
         playerLayer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         [self.layer addSublayer:playerLayer];
     }
 
-    [player seekToTime:kCMTimeZero];
-    [player play];
-}
-
-- (void)videoDidEnd:(NSNotification *)notification
-{
-    [player seekToTime:kCMTimeZero toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    [queuePlayer play];
 }
 
 - (void)stopAnimation
 {
-    [player pause];
+    [queuePlayer pause];
     [super stopAnimation];
 }
 
@@ -66,10 +61,5 @@
 
 - (BOOL)hasConfigureSheet { return NO; }
 - (NSWindow *)configureSheet { return nil; }
-
-- (void)dealloc
-{
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-}
 
 @end

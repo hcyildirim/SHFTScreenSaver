@@ -1,5 +1,5 @@
 #!/bin/bash
-PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.0/SHFTScreenSaver.pkg"
+PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.1/SHFTScreenSaver.pkg"
 PKG_PATH="/tmp/SHFTScreenSaver.pkg"
 
 # Download and install
