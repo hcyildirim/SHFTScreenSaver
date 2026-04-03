@@ -1,8 +1,10 @@
 #import <ScreenSaver/ScreenSaver.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <mach/mach.h>
 
 #define MAX_BLINKS 6
+#define MAX_RSS_BYTES (80 * 1024 * 1024)  // 80 MB — kill process above this
 
 typedef struct {
     CGRect frame;
@@ -26,6 +28,7 @@ static CellInfo *s_cellInfos = NULL;
 static int s_cellCount = 0;
 static int s_imgW = 0;
 static int s_imgH = 0;
+static CGColorRef s_blinkColor = NULL;
 static BOOL s_setupDone = NO;
 
 @interface SHFTScreenSaverView : ScreenSaverView
@@ -75,6 +78,20 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
 {
     [super startAnimation];
 
+    // Self-monitoring: kill process if RSS exceeds threshold.
+    // legacyScreenSaver leaks ~15MB per cycle (Apple bug).
+    // _exit(0) kills the entire process; system restarts fresh on next activation.
+    {
+        struct mach_task_basic_info info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      (task_info_t)&info, &count) == KERN_SUCCESS) {
+            if (info.resident_size > MAX_RSS_BYTES) {
+                _exit(0);
+            }
+        }
+    }
+
     if (!s_setupDone) {
         s_setupDone = YES;
         [self setupSharedResources];
@@ -84,18 +101,19 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     self.layer.contents = (__bridge id)s_bgImage;
     self.layer.contentsGravity = kCAGravityResize;
 
-    // Create blink sublayers
+    // Create blink sublayers (reused across start/stop cycles)
     for (int i = 0; i < MAX_BLINKS; i++) {
         if (!blinkLayers[i]) {
             blinkLayers[i] = [CALayer layer];
-            blinkLayers[i].backgroundColor = CGColorCreateGenericRGB(
-                SHFT_GREEN_R, SHFT_GREEN_G, SHFT_GREEN_B, 1.0);
+            blinkLayers[i].backgroundColor = s_blinkColor;
             blinkLayers[i].opacity = 0;
             blinkLayers[i].actions = @{
                 @"opacity": [NSNull null],
                 @"position": [NSNull null],
                 @"bounds": [NSNull null]
             };
+        }
+        if (blinkLayers[i].superlayer != self.layer) {
             [self.layer addSublayer:blinkLayers[i]];
         }
     }
@@ -196,6 +214,10 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
     CGContextRelease(tmpCtx);
     free(pixels);
     CGColorSpaceRelease(cs);
+
+    if (!s_blinkColor) {
+        s_blinkColor = CGColorCreateGenericRGB(SHFT_GREEN_R, SHFT_GREEN_G, SHFT_GREEN_B, 1.0);
+    }
 }
 
 - (void)tick
@@ -254,10 +276,9 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
         CFRelease(cfTimer);
         cfTimer = NULL;
     }
-    // Remove sublayers to avoid extra compositing overhead.
+    // Hide sublayers — reused on next startAnimation, no reallocation.
     for (int i = 0; i < MAX_BLINKS; i++) {
-        [blinkLayers[i] removeFromSuperlayer];
-        blinkLayers[i] = nil;
+        blinkLayers[i].opacity = 0;
     }
     // layer.contents (shared CGImage ref) stays visible during rapid cycling.
 }
@@ -271,6 +292,10 @@ static void timerCallback(CFRunLoopTimerRef timer, void *info) {
         CFRunLoopTimerInvalidate(cfTimer);
         CFRelease(cfTimer);
         cfTimer = NULL;
+    }
+    for (int i = 0; i < MAX_BLINKS; i++) {
+        [blinkLayers[i] removeFromSuperlayer];
+        blinkLayers[i] = nil;
     }
 }
 

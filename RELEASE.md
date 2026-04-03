@@ -1,41 +1,38 @@
 # SHFT Screen Saver - Release Checklist
 
 Her kod değişikliğinden sonra bu adımları sırayla takip et.
+Versiyon numarası 3 yerde güncellenmeli: Info.plist, pkgbuild komutu, simplemdm_deploy.sh (PKG_URL + echo).
 
 ## 1. Build
 ```bash
-cd /Users/hcyildirim/Documents/Development/SHFTScreenSaver
 bash build.sh
 ```
 
-## 2. Local Install & Test
+## 2. Memory Leak Test
 ```bash
-killall legacyScreenSaver 2>/dev/null; killall ScreenSaverEngine 2>/dev/null; sleep 1
-rm -rf ~/Library/Screen\ Savers/SHFTScreenSaver.saver
-cp -R build/SHFTScreenSaver.saver ~/Library/Screen\ Savers/
-open -a ScreenSaverEngine
+bash test_memory.sh --build
 ```
-- RAM monitoring: `ps -o rss= -p $(pgrep -x legacyScreenSaver)`
-- 3 dakika sabit kalmalı
+- Build + install + 5x start/stop döngüsü + 30s steady-state testi
+- Tüm testler PASS olmalı
 
 ## 3. Package (.pkg)
 ```bash
 pkgbuild --root build/SHFTScreenSaver.saver \
   --install-location "/Library/Screen Savers/SHFTScreenSaver.saver" \
-  --identifier com.shft.screensaver --version 1.0 \
+  --identifier com.shft.screensaver --version <VERSIYON> \
   build/SHFTScreenSaver.pkg
 ```
 
-## 4. Update Deploy Script
-```bash
-PKG_B64=$(base64 -i build/SHFTScreenSaver.pkg)
-sed -i '' "3s|^PKG_BASE64=.*|PKG_BASE64='${PKG_B64}'|" simplemdm_deploy.sh
-```
-- Doğrula: `head -3 simplemdm_deploy.sh` → PKG_BASE64='...' (tek tırnak içinde)
-
-## 5. Git Commit & Push
+## 4. Git Commit & Push
 ```bash
 git add -A
-git commit -m "description"
+git commit -m "v<VERSIYON>: açıklama"
 git push
 ```
+
+## 5. GitHub Release & Deploy Script Güncelle
+```bash
+gh release create v<VERSIYON> build/SHFTScreenSaver.pkg --title "v<VERSIYON>" --notes "açıklama"
+```
+- `simplemdm_deploy.sh` içindeki `PKG_URL` ve son satırdaki echo'yu yeni versiyona güncelle
+- Tekrar commit & push

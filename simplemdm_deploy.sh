@@ -1,5 +1,5 @@
 #!/bin/bash
-PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.3/SHFTScreenSaver.pkg"
+PKG_URL="https://github.com/hcyildirim/SHFTScreenSaver/releases/download/v3.4/SHFTScreenSaver.pkg"
 PKG_PATH="/tmp/SHFTScreenSaver.pkg"
 
 # Download and install
@@ -180,10 +180,11 @@ XMLEOF
     AGENT_DIR="${USER_HOME}Library/LaunchAgents"
     AGENT_FILE="$AGENT_DIR/com.shft.screensaver.cleanup.plist"
     if [ -f "$AGENT_FILE" ]; then
-        sudo -u "$USERNAME" launchctl unload "$AGENT_FILE" 2>/dev/null
+        UID_NUM=$(id -u "$USERNAME" 2>/dev/null)
+        sudo -u "$USERNAME" launchctl bootout "gui/$UID_NUM/com.shft.screensaver.cleanup" 2>/dev/null
         rm -f "$AGENT_FILE"
     fi
 
     echo "Screen saver set for user: $USERNAME"
 done
-echo "SHFT Screen Saver v3.3 installed and activated for all users"
+echo "SHFT Screen Saver v3.4 installed and activated for all users"
